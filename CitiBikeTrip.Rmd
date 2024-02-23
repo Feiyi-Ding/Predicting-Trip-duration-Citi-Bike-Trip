@@ -1,0 +1,429 @@
+---
+title: "Citi Bike Trip"
+author: 
+ - "Feiyi Ding"
+output:
+  pdf_document: default
+  html_document:
+    number_sections: no
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE,
+                      tidy=TRUE, tidy.opts=list(width.cutoff=80))
+```
+
+```{r library, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+library(DT)
+library(data.table)
+library(ggplot2)
+library(GGally)
+library(forcats)
+library(dplyr)
+library(lubridate)
+library(caTools)
+library(Metrics)
+library(rpart)
+library(glmnet)
+library(MLmetrics)
+library(caret)
+library(randomForest)
+library(gbm)
+library(neuralnet)
+library(caretEnsemble)
+```
+
+```{r loadData}
+dat_full <- fread("JC-202010-citibike-tripdata.csv")
+
+# randomly sample 25% of the dataset
+set.seed(1)
+dat <- dat_full[sample(nrow(dat_full), 0.25*nrow(dat_full)), ]
+```
+
+
+
+# 1. Introduction
+
+```{r introduction}
+head(dat)
+str(dat)
+```
+Citi Bike can be seen everywhere in New York City. Many people choose to use it either for transportation or a bicycle trip to explore the city. This project focuses on building machine learning models to predict the trip duration of Citi Bike. The data set is obtained from Citi Bike's website.  
+The data set contains trip data of Citi Bike in October 2020. In the original data set, there are over thirty thousand data entries. Apart from the trip duration, the data also includes information about the time (start/end time and date), station (start/end name, id, latitude/longitude), bike (id), and user (type, gender, year of birth). When building the models, only  25% of randomly selected data are used.  
+The models built in this project can predict the trip duration with given information. All the information needed is available at the beginning of the trip. The prediction can tell the user how long their trip will be if they enter the destination. This can be a new feature for the Citi Bike app. Users who use Citi Bike as transportation will find it useful. If this new feature is introduced in the app, people can plan their trip ahead of time[1].  
+
+# 2. Exploratory Analysis
+## 2.1 Trip duration
+```{r tripduration}
+summary(dat$tripduration)
+ggplot(dat[dat$tripduration < 3600,],aes(x=tripduration)) + 
+  geom_line(stat="bin", binwidth=50,size=1) +
+  labs(title="Trip Duration (less than 1 hour)", x="Trip Duration") 
+```
+Most trips finished within 1099 seconds. There are some extreme data such as 1579726 secconds (more than 18 days), which should be removed as outlier.
+
+## 2.2 Popular stations and routes
+
+```{r startStation}
+top_10_start_station <- as.data.frame(sort(table(dat$`start station name`),decreasing=TRUE)[1:5])
+ggplot(top_10_start_station,aes(x = reorder(Var1,Freq), y = Freq)) + 
+  geom_col(aes(fill=Var1))+ 
+  coord_flip() + 
+  theme(legend.position = "none") + 
+  labs(title = "Most Frequent Start Stations", y = "Frequency", x = "Stations") +
+  geom_text(aes(label= Freq), size = 3, position = position_stack(vjust = 0.5))
+
+```
+
+```{r endStation}
+top_10_end_station <- as.data.frame(sort(table(dat$`end station name`),decreasing=TRUE)[1:5])
+ggplot(top_10_end_station,aes(x = reorder(Var1,Freq), y = Freq)) + 
+  geom_col(aes(fill=Var1))+ 
+  coord_flip() + 
+  theme(legend.position = "none") + 
+  labs(title = "Most Frequent End Stations", y = "Frequency", x = "Stations") +
+  geom_text(aes(label= Freq), size = 3, position = position_stack(vjust = 0.5))
+```
+
+```{r route}
+route <- dat %>% 
+  group_by(`start station name`, `end station name`) %>%
+  summarise(Freq = n())
+route$routes <- paste(route$`start station name`,"-",route$`end station name`)
+route <- route[order(route$Freq, decreasing = T),]
+
+ggplot(route[1:5, ],aes(x = reorder(routes,Freq), y = Freq)) + 
+  geom_col(aes(fill=routes))+ 
+  coord_flip() + 
+  theme(legend.position = "none") + 
+  labs(title = "Most Frequent Routes", y = "Frequency", x = "Route") +
+  geom_text(aes(label= Freq), size = 3, position = position_stack(vjust = 0.5))
+```
+	
+Grove St PATH, Newport Pkwy, Newport PATH, Liberty Light Rail, and Hamilton Park are top 5 most popular stations for both start stations and end stations. Three out of five most popular routes have the same start station and end stations.
+
+## 2.3 Gender and age
+```{r gender}
+ggplot(dat, aes(x=gender))+ 
+  geom_bar(aes(fill=gender)) + 
+  labs(title = "Gender Types")
+```
+0=unknown; 1=male; 2=female
+```{r age}
+dat$age = as.numeric(2020 - dat$`birth year`)
+summary(dat$age)
+age.group <- c(paste(seq(0, 60, by = 10), seq(0 + 10 - 1, 70 - 1, by = 10),
+                sep = "-"), paste(70, "+", sep = ""))
+age.group = age.group[-1]
+dat$age.group <- cut(dat$age, breaks = c(seq(10, 70, by = 10), Inf), labels = age.group, right = FALSE)
+ggplot(dat, aes(x=age.group))+ 
+  geom_bar(aes(fill=age.group)) + 
+  labs(title = "Age Group")
+```
+
+```{r}
+ggplot(dat[dat$tripduration < 3600], aes(x=age,y=tripduration ,colour=factor(gender))) + 
+  stat_summary(fun.y="mean", geom="line", size=1) + facet_grid(gender ~ .) + 
+  labs(title = "Relationship between average trip duration (within one hour) and age per gender", y="average trip duration")
+```
+The majority of user are male.   
+Users in their 20s and 30s account for the largest proportion.  
+Exclude gender unknown users, yong and mid-age female users have longer average trip duration that male in their age. While for user who is over 60 years old, male users have longer average trip duration than female.
+
+## 2.3 User Type
+```{r userType}
+ggplot(dat, aes(x=usertype))+ 
+  geom_bar(aes(fill=usertype)) + 
+  labs(title = "User Types", x= "User Type")
+```
+
+```{r}
+boxplot(tripduration~usertype, data=dat[dat$tripduration<3600,],main = "Trip duration per user type ", 
+        xlab = "User Type", ylab = "Trip Duration")
+```
+
+The majority of user are subscribers (annual). However, customers (24-hour pass or 3-day pass user) tends to have a longer trip duration.
+
+# 3. Data Cleaning & Imputation
+```{r NAs}
+sapply(dat, function(x) sum(is.na(x)))
+```
+There's no na in the data set
+
+```{r date.time}
+dat$starttime = ymd_hms(dat$starttime,tz=Sys.timezone())
+dat$stoptime = ymd_hms(dat$stoptime,tz=Sys.timezone())
+breaks <- hour(hm("00:00", "6:00", "12:00", "18:00", "23:59"))
+labels <- c("Night", "Morning", "Afternoon", "Evening")
+dat$time.of.day <- cut(x=hour(dat$starttime), breaks = breaks, labels = labels, include.lowest=TRUE)
+```
+Add morning/afternoon/evening label column to the data set.  
+The age column and age.group column have been added during exploratory data analysis.
+
+```{r delete.extreme.data}
+citi <- dat[dat$tripduration <= 7200, ]
+```
+Remove outliers, whose trip duration time is unrealistic.
+
+```{r remove.column}
+citi <- as.data.frame(citi)
+citi <- citi[, -3]
+```
+Remove stop time as it contains the information for duration.
+
+```{r}
+citi$gender <- factor(citi$gender)
+colnames(citi) <- c("tripduration", "starttime", "start_station_id", "start_station_name", "start_station_latitude", "start_station_longitude", "end_station_id", "end_station_name", "end_station_latitude", "end_station_longitude", "bikeid", "usertype", "birth_year", "gender", "age", "age_group", "time_of_day")
+
+```
+
+```{r feature engineering, results='hide', message=FALSE, warning=FALSE}
+# backward selection
+start_mod = lm(tripduration~.,data=citi)
+empty_mod = lm(tripduration~1,data=citi)
+full_mod = lm(tripduration~.,data=citi)
+backwardStepwise = step(start_mod, 
+                        scope=list(upper=full_mod,lower=empty_mod), 
+                        direction='backward')
+```
+The variables selected by backward selection are `starttime`, `start station name`, `end station name`, `bikeid`, `usertype`, `birth year`, `gender`, `time.of.day`. 
+
+# 4. Machine Learning Models
+```{r train/test}
+set.seed(1)
+split = sample.split(citi ,SplitRatio = 0.7)
+train = citi[split, ]
+test = citi[!split, ]
+test <- test[test$end_station_name != "Broadway & W 49 St", ] #fix trouble in predict
+```
+
+The  5 machine learning models chosen for this project are linear regression, decision tree, random forest, boosting, and neural network. Since the project aims at predicting the trip duration (numeric), so I chose algorithms that works well in building supervised regression models[2]. I also take the running time into consideration. Considering I only worked on a small proportion of the entire  Citi Bike data set, if the model takes too long to run, it may fail to provide value in the real world. 
+
+## Model 1 linear regression
+
+Linear regression is a linear approach to modeling the relationship between dependent independent variables. There are four assumptions in linear regression: 1) there exists a linear relationship between the independent (x) and dependent (y) variables; 2) independence assumption: the residuals are independent; 3) homoscedasticity assumption: the residuals have constant variance at every level of x; 4) normality assumption: the residuals of the model are normally distributed. Based on the assumptions, we can know that linear regression has some limitation: limited to linear relationship, sensitive to outliers, and linear regression only consider the relationship between the mean of independent variables and the value of dependent variable. Since trip duration is a numeric variable, I think it is a good choice that starts with a basic model like linear regression.  
+
+```{r}
+trControl=trainControl(method = "repeatedcv",
+  number = 5,
+  repeats = 5)
+set.seed(1)
+cv.lm = train(tripduration ~ starttime + start_station_id + end_station_id + 
+                          bikeid + usertype + birth_year + gender + time_of_day,
+                 data=train, method="lm", trControl=trControl)
+cv.lm$results
+```
+
+```{r}
+lm = lm(tripduration ~ starttime + start_station_id + end_station_id + 
+          bikeid + usertype + birth_year + gender + time_of_day,
+        data=train)
+pred.lm = predict(lm,newdata=test)
+rmse.lm = RMSE(test$tripduration, pred.lm)
+rmse.lm
+mae.lm = MAE(test$tripduration, pred.lm)
+mae.lm
+r2.lm = R2_Score(y_pred = pred.lm, test$tripduration)
+r2.lm
+
+```
+
+## Model 2 decision tree
+
+Decision tree can be used for both regression and classification models. It is a fast model with interpretable predictions. So I chose decision tree. Since decision prefers categorical variable, one assumption when building the tree is that if the values are continuous, then they will be discretized before building the model. The biggest limitations of decision tree is overfitting. If the tree is too complex, it may have poor performance on the testing data.
+
+```{r}
+trControl=trainControl(method = "repeatedcv",
+  number = 5,
+  repeats = 5)
+set.seed(1)
+cv.tree = train(tripduration ~ starttime + start_station_id + end_station_id + 
+                          bikeid + usertype + birth_year + gender + time_of_day,
+                 data=train, method="rpart", trControl=trControl)
+cv.tree$results
+```
+
+```{r}
+trellis.par.set(caretTheme())
+plot(cv.tree)
+```
+
+```{r}
+tree = rpart(tripduration ~ starttime + start_station_id + end_station_id + 
+               bikeid + usertype + birth_year + gender + time_of_day,
+             data=train,
+             cp = 0.006855427)
+pred.tree = predict(tree,newdata=test)
+rmse.tree = RMSE(test$tripduration, pred.tree)
+rmse.tree
+mae.tree = MAE(test$tripduration, pred.tree)
+mae.tree
+r2.tree = R2(pred = pred.tree, obs = test$tripduration)
+r2.tree
+```
+
+## Model 3 random forest
+
+Random Forest is a ensemble learning method. It is consisted of many decision trees. Usually, random forest has better predictions than decision tree. So, I chose it to see the result. Random Forest doesn't have distributional assumptions as the model can handle all types of data. The limitation of random forest is that the model is biased in favor of predictors with more levels. Besides, random forest also has overfitting issue.  
+
+```{r model 2-1}
+trControl=trainControl(method = "repeatedcv",
+  number = 5,
+  repeats = 5)
+set.seed(1)
+cvForest = train(tripduration ~ starttime + start_station_id + end_station_id + 
+                          bikeid + usertype + birth_year + gender + time_of_day,
+                 data=train, method="rf",ntree=200,trControl=trControl)
+cvForest$results
+```
+
+```{r}
+trellis.par.set(caretTheme())
+plot(cvForest)
+```
+
+```{r model 2-2}
+rf = randomForest(tripduration ~ starttime + start_station_id + end_station_id + 
+          bikeid + usertype + birth_year + gender + time_of_day,
+        data=train,
+        mtry = 6,
+        ntree=200)
+pred.rf = predict(rf,newdata=test)
+rmse.rf = RMSE(test$tripduration, pred.rf)
+rmse.rf
+mae.rf = MAE(test$tripduration, pred.rf)
+mae.rf
+r2.rf = R2(pred = pred.rf, obs = test$tripduration)
+r2.rf
+```
+
+## Model 4 boosting
+
+Boosting is an ensemble meta-algorithm with the advantage of reducing bias and variance. The assumption for boosting model is that observations should be independent. The limitation is that boosting is very sensitive to outliers and hard to scale up. I chose boosting to compare its performance to random forest, another ensemble algorithm. The run time for boosting is shorter but the prediction are worse.  
+
+```{r model 4-1}
+fitControl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 5)
+
+set.seed(1)
+gbmFit <- train(tripduration ~ starttime + start_station_id + end_station_id + 
+                  bikeid + usertype + birth_year + gender + time_of_day, 
+                 data = train, 
+                 method = "gbm", 
+                 trControl = fitControl,
+                 verbose = FALSE)
+
+gbmFit$results
+```
+
+```{r}
+trellis.par.set(caretTheme())
+plot(gbmFit)
+```
+
+```{r}
+summary(gbmFit)
+```
+
+```{r model 4-2}
+pred.gbm <- predict(gbmFit, newdata = test)
+rmse.gbm = RMSE(test$tripduration, pred.gbm)
+rmse.gbm
+mae.gbm = MAE(test$tripduration, pred.gbm)
+mae.gbm
+r2.gbm = R2(pred = pred.gbm, obs = test$tripduration)
+r2.gbm
+```
+
+## Model 5 neural net
+
+Neural network is a series of algorithms that tries to mimic how human brain operates and uses it to underlying relationships in the data set. it doesn't have assumptions for the data. One biggest limitation of neural network is its black box nature. It is very hard to understand how the neural network get this specify prediction.
+
+```{r model 5-1, results='hide', message=FALSE, warning=FALSE}
+control <- trainControl(method="repeatedcv", number=5, repeats=5)
+
+
+cv.nn <- train(tripduration ~ starttime + start_station_id + end_station_id +
+                 bikeid + usertype + birth_year + gender + time_of_day,
+               data=train, method="nnet", trControl = control, preProc=c("center", "scale"), linout = TRUE)
+
+```
+
+```{r}
+cv.nn$results
+```
+
+```{r}
+trellis.par.set(caretTheme())
+plot(cv.nn)
+```
+
+```{r}
+pred.nn <- predict(cv.nn, newdata = test)
+rmse.nn = RMSE(test$tripduration, pred.nn)
+rmse.nn
+mae.nn = MAE(test$tripduration, pred.nn)
+mae.nn
+r2.nn = R2(pred = pred.nn, obs = test$tripduration)
+r2.nn
+```
+## ensemble model
+```{r, results='hide', message=FALSE, warning=FALSE}
+control_stacking <- trainControl(method="repeatedcv", number=5, repeats=3, savePredictions=TRUE)
+
+algorithms_to_use <- list(lm = caretModelSpec(method = 'lm'),
+                       rpart = caretModelSpec(method = 'rpart'), 
+                       rf = caretModelSpec(method = 'rf', ntree=200), 
+                       gbm = caretModelSpec(method = 'gbm'), 
+                       nnet = caretModelSpec(method="nnet", preProc=c("center", "scale"), linout = TRUE))
+
+set.seed(1)
+stacked_models <- caretList(tripduration ~ starttime + start_station_id + end_station_id + 
+                              bikeid + usertype + birth_year + gender + time_of_day, 
+                    data = test, trControl=control_stacking, tuneList=algorithms_to_use)
+
+```
+
+```{r}
+ensemble <- caretEnsemble(
+  stacked_models, 
+  metric="RMSE",
+  trControl=trainControl(
+    number=5
+  ))
+summary(ensemble)
+```
+
+```{r}
+predictTest = predict(ensemble, newdata = test)
+
+rmse.ensemble = RMSE(test$tripduration, predictTest)
+rmse.ensemble
+mae.ensemble = MAE(test$tripduration, predictTest)
+mae.ensemble
+r2.ensemble = R2(predictTest, test$tripduration)
+r2.ensemble
+
+
+```
+
+# 5. Results
+```{r}
+res <- data.frame(model = c('lm', 'rpart', 'rf', 'gbm', 'nnet', 'ensemble'),
+                  rmse = c(rmse.lm, rmse.tree, rmse.rf, rmse.gbm, rmse.nn, rmse.ensemble),
+                  mae = c(mae.lm, mae.tree, mae.rf, mae.gbm, mae.nn, mae.ensemble),
+                  r2 = c(r2.lm, r2.tree, r2.rf, r2.gbm, r2.nn, r2.ensemble))
+res
+```
+
+# 6. Discussion and Next Steps
+
+The ensemble model no doubt has the best performance. Among the 5 models I built, the random forest model has the best performance while the neural network has the worst performance. Since the linear correlation between tripduration and other variable is not very strong, so the prediction of linear regression is not very good. Random forest is the ensemble model of decision tree, so it will have a better prediction. As for boosting and neural network, I think to improve their performance, more outliers should be removed and some parameters should be selected manually instead of only rely on cross validation. Besides, when tuning the parameters, more methods can be used instead of just cross validation may be able to generate better model.   
+
+# 7. References
+[1] Shah, V. (2018, May 25). Citi Bike 2017 Analysis. Retrieved December 10, 2020, from https://towardsdatascience.com/citi-bike-2017-analysis-efd298e6c22c  
+[2] An easy guide to choose the right Machine Learning algorithm. (n.d.). Retrieved December 10, 2020, from https://www.kdnuggets.com/2020/05/guide-choose-right-machine-learning-algorithm.html  
